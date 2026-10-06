@@ -1,0 +1,125 @@
+import {chromium} from 'playwright';
+import assert from 'node:assert/strict';
+import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import {resolve} from 'node:path';
+
+const root=resolve(import.meta.dirname,'..');
+const artifacts=resolve(root,'test-results');
+await mkdir(artifacts,{recursive:true});
+const fixtureDir=resolve(root,'private-fixtures');await mkdir(fixtureDir,{recursive:true});
+const silence=Buffer.alloc(44+16000*3*2);
+silence.write('RIFF',0);silence.writeUInt32LE(silence.length-8,4);silence.write('WAVEfmt ',8);silence.writeUInt32LE(16,16);silence.writeUInt16LE(1,20);silence.writeUInt16LE(1,22);silence.writeUInt32LE(16000,24);silence.writeUInt32LE(32000,28);silence.writeUInt16LE(2,32);silence.writeUInt16LE(16,34);silence.write('data',36);silence.writeUInt32LE(silence.length-44,40);
+await writeFile(resolve(fixtureDir,'silence.wav'),silence);
+const evidence={started:new Date().toISOString(),checks:[],limitations:['Chromium desktop and emulated mobile viewport only; no Safari, physical-phone or outdoor trial.','Microphone tests use a generated MediaStream, not a hardware microphone.']};
+function check(name){evidence.checks.push(name);console.log(`PASS ${name}`);}
+const browser=await chromium.launch({headless:true,args:['--use-angle=swiftshader','--enable-unsafe-swiftshader']});
+const context=await browser.newContext({acceptDownloads:true,viewport:{width:1365,height:900}});
+try {
+  await context.addInitScript(()=>{
+    window.testMicMode='denied';window.testCaptures=[];
+    navigator.mediaDevices.getUserMedia=async constraints=>{
+      if(constraints.video!==false) throw new Error('Unexpected video request');
+      if(window.testMicMode==='denied') throw new DOMException('Microphone permission denied','NotAllowedError');
+      const generator=new AudioContext();await generator.resume();
+      const oscillator=generator.createOscillator();oscillator.frequency.value=1100;
+      const gain=generator.createGain();gain.gain.value=.15;
+      const destination=generator.createMediaStreamDestination();
+      oscillator.connect(gain);gain.connect(destination);oscillator.start();
+      const capture={stream:destination.stream,context:generator};window.testCaptures.push(capture);
+      for(const track of destination.stream.getTracks()){
+        const stop=track.stop.bind(track);track.stop=()=>{stop();oscillator.stop();void generator.close();};
+      }
+      return destination.stream;
+    };
+  });
+  const page=await context.newPage();
+  const failures=[];const writes=[];
+  page.on('pageerror',e=>failures.push(e.message));
+  page.on('request',request=>{if(request.method()!=='GET')writes.push({method:request.method(),url:request.url()});});
+  const counter=page.locator('#counter');
+  const prepare=async()=>{
+    await page.locator('#prepare').click();
+    await page.locator('#model-status').filter({hasText:'Ready for offline listening'}).waitFor({timeout:90000});
+  };
+  await page.goto('http://127.0.0.1:4176/');await prepare();
+  assert.equal(await page.evaluate(()=>window.testCaptures.length),0);
+  check('Preparation caches the app and model without activating a microphone');
+  await page.locator('#demo').click();
+  await page.locator('#demo-result').filter({hasText:'Example recording'}).waitFor({timeout:60000});
+  assert.match(await page.locator('#demo-result').innerText(),/Wild animals|Bird|Animal/);
+  assert.equal(await counter.innerText(),'0 of 3 stops');
+  check('Real YAMNet recognizes the credited birdsong; the demo creates no journal entry');
+  const baseline=await page.evaluate(()=>tf.memory().numTensors);
+  await page.locator('#listen').click();
+  await page.locator('#error').filter({hasText:'Microphone permission denied'}).waitFor();
+  assert.equal(await counter.innerText(),'0 of 3 stops');
+  check('Denied microphone permission leaves the journal unchanged and shows an error');
+  await page.evaluate(()=>{window.testMicMode='generated';});
+  await page.locator('#listen').click();
+  await page.locator('#activity').filter({hasText:'Listening…'}).waitFor();
+  await page.locator('#cancel').click();
+  await page.locator('#activity').filter({hasText:'Recording cancelled'}).waitFor();
+  assert.equal(await counter.innerText(),'0 of 3 stops');
+  await page.waitForFunction(()=>window.testCaptures.every(c=>c.stream.getTracks().every(t=>t.readyState==='ended') && c.context.state==='closed'));
+  check('Cancel stops the generated microphone track and closes its audio context');
+  await page.locator('#stop-name').fill('Generated microphone test');
+  await page.locator('#listen').click();
+  await counter.filter({hasText:'1 of 3 stops'}).waitFor({timeout:60000});
+  await page.waitForFunction(()=>window.testCaptures.every(c=>c.stream.getTracks().every(t=>t.readyState==='ended') && c.context.state==='closed'));
+  assert.match(await page.locator('.note-card .source').innerText(),/microphone observation/);
+  check('A full six-second generated recording produces one labelled entry and releases capture');
+  await page.locator('#audio-file').setInputFiles({name:'not-audio.wav',mimeType:'audio/wav',buffer:Buffer.from('invalid audio')});
+  await page.locator('#error').waitFor({state:'visible'});
+  assert.equal(await counter.innerText(),'1 of 3 stops');
+  check('Invalid audio produces an error without consuming a listening stop');
+  await page.locator('#audio-file').setInputFiles(resolve(root,'private-fixtures/silence.wav'));
+  await counter.filter({hasText:'2 of 3 stops'}).waitFor({timeout:60000});
+  assert.match(await page.locator('.note-card').nth(1).innerText(),/A very faint moment/);
+  assert.deepEqual(await page.locator('.note-card').nth(1).locator('.tag').allTextContents(),['Silence']);
+  await page.locator('#stop-name').fill('Example, not a field observation');
+  await page.locator('#audio-file').setInputFiles(resolve(root,'samples/birdsong.ogg'));
+  await counter.filter({hasText:'3 of 3 stops'}).waitFor({timeout:60000});
+  assert.match(await page.locator('.note-card').nth(2).innerText(),/Nature stood out/);
+  await page.locator('#note-2').fill('Public-domain example used in automated testing.');
+  assert.equal(await page.locator('#listen').isDisabled(),true);
+  assert.equal(await page.locator('#complete').isVisible(),true);
+  check('Silence is flagged, birdsong suggests Nature, imported provenance is visible and the loop stops at three');
+  const downloadPromise=page.waitForEvent('download');await page.locator('#export').click();
+  const download=await downloadPromise;const exportedPath=resolve(artifacts,'journal.json');await download.saveAs(exportedPath);
+  const journal=JSON.parse(await readFile(exportedPath,'utf8'));
+  assert.equal(journal.stops.length,3);
+  assert.deepEqual(journal.stops.map(s=>s.source),['microphone','imported-audio','imported-audio']);
+  assert.equal(journal.stops[2].note,'Public-domain example used in automated testing.');
+  assert.equal(Object.hasOwn(journal,'audio'),false);
+  assert.ok(journal.stops.every(s=>!Object.hasOwn(s,'audio')&&!Object.hasOwn(s,'samples')));
+  check('JSON export preserves notes and provenance and contains no audio samples');
+  await page.locator('#remember').check();
+  await page.reload();assert.equal(await counter.innerText(),'3 of 3 stops');
+  assert.equal(await page.locator('#note-2').inputValue(),journal.stops[2].note);
+  await page.locator('#forget').click();await page.reload();
+  assert.equal(await counter.innerText(),'0 of 3 stops');
+  check('Journal storage requires opt-in, survives reload, and Forget removes it');
+  await prepare();await context.setOffline(true);
+  await page.reload();await prepare();
+  await page.locator('#demo').click();
+  await page.locator('#demo-result').filter({hasText:'Example recording'}).waitFor({timeout:60000});
+  assert.match(await page.locator('#demo-result').innerText(),/Wild animals|Bird|Animal/);
+  const afterOffline=await page.evaluate(()=>tf.memory().numTensors);
+  assert.equal(afterOffline,baseline);
+  check('Cached app, model and example run after offline reload; inference has no persistent tensor growth');
+  await context.setOffline(false);
+  await page.screenshot({path:resolve(artifacts,'desktop.png'),fullPage:true});
+  await page.setViewportSize({width:390,height:844});
+  const dimensions=await page.evaluate(()=>({scroll:document.documentElement.scrollWidth,width:innerWidth}));
+  assert.ok(dimensions.scroll<=dimensions.width,JSON.stringify(dimensions));
+  assert.equal(await page.locator('#listen').isEnabled(),true);
+  await page.screenshot({path:resolve(artifacts,'mobile.png'),fullPage:true});
+  check('390px mobile layout has no horizontal overflow and keeps the listening controls usable');
+  assert.deepEqual(failures,[]);assert.deepEqual(writes,[]);
+  check('No browser errors or POST/PUT/network-upload requests occurred during the test');
+  evidence.browser=browser.version();evidence.passed=true;
+} catch(e){evidence.passed=false;evidence.failure=e.stack;throw e;}
+finally{
+  evidence.finished=new Date().toISOString();await writeFile(resolve(artifacts,'browser-validation.json'),JSON.stringify(evidence,null,2));
+  await context.setOffline(false).catch(()=>{});await browser.close();
+}
