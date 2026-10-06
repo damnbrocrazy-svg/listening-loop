@@ -1,0 +1,13 @@
+{
+  "name": "listening-loop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Three listening stops, one offline audio model, a reason to go outside.",
+  "scripts": {
+    "start": "node scripts/serve.mjs",
+    "test": "node --test --test-isolation=none tests/core.test.mjs",
+    "prepare:vendor": "node scripts/vendor.mjs"
+  },
+  "dependencies": {"@tensorflow/tfjs": "4.22.0"}
+}
